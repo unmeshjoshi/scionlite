@@ -63,10 +63,6 @@ public class ObjectStore {
         return ObjectCodec.decode(bytes);
     }
 
-    public Commit commit(ObjectId id) {
-        return as(id, Commit.class);
-    }
-
     public Tree tree(ObjectId id) {
         return as(id, Tree.class);
     }

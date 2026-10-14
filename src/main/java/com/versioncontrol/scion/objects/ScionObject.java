@@ -1,7 +1,7 @@
 package com.versioncontrol.scion.objects;
 
-/** An immutable, content-addressed object: a file's bytes, a directory listing, or a commit. */
-public sealed interface ScionObject permits Blob, Tree, Commit {
+/** An immutable, content-addressed object: a file's bytes or a directory listing. */
+public sealed interface ScionObject permits Blob, Tree {
     ObjectType type();
 
     /** The bytes after the header. Two objects with the same content have the same id. */

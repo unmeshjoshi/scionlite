@@ -1,78 +1,162 @@
-# Scion — TODO
+# Scion Lite: TODO (redesign to follow the Scion post)
 
-Scion is a distributed source control system built on tickloom. Every component runs in the tickloom
-single-threaded tick loop, and every test runs on the simulated network and simulated filesystem.
+Source: "Redesigning source control at Anthropic" (anthropic.com/engineering/redesigning-source-control).
+Scion Lite models only what the post describes. Where the post is silent, the choice is labelled
+**[Lite assumption]** in the code and in `mapping.md`.
 
-## 0. Project setup
-- [x] Gradle project depending on `tickloom:0.1.0-beta.4` and `tickloom-testkit:0.1.0-beta.4` (mavenLocal)
-- [x] README with architecture and usage
+## Decisions (from the user)
+- Model every tier: spanner, cloud-storage, scion-server, scion-cache, scion-daemon, scn.
+- Replace the git-style design: client-side history, push, and Raft-style replication.
+- Derived data: the root tree of each changeset only.
 
-## 1. Object model (pure, no I/O)
-- [x] `ObjectId` — SHA-256 of the object's canonical bytes, hex encoded
-- [x] `Blob`, `Tree` (sorted entries: name, kind FILE/DIR, id), `Commit` (tree, parents, author, timestamp, message)
-- [x] `ObjectCodec` — canonical encoding `"<type> <len>\0<content>"`; decode back; id is stable across runs
-- [x] `ObjectDatabase` (read) / in-memory implementation
-- [x] Tests: ids are content addresses, round trip, tree order does not depend on insertion order
+## 1. Remove the git-style design
+- [x] Delete the replicated push server, the git-style local `Repository`, and its protocol and tests
+- [x] Keep `objects` (ObjectId, Blob, Tree, TreeEntry), `diff`, `merge` (TextMerge, TreeMerge) and `storage.Journal`
 
-## 2. Snapshots
-- [x] Build nested trees from a flat `path -> bytes` map (directories become trees)
-- [x] Read a tree back into a flat map
-- [x] Reject invalid paths (empty segments, `.`/`..`, absolute)
-- [x] Tests: identical content gives identical root ids, nested dirs, round trip
+## 2. Data model
+- [x] `Changeset`: parents, author, time, message, and the files changed relative to the **first parent**
+      (path to blob id, or deleted). No tree pointer. Content-addressed id **[Lite assumption]**
+- [x] Blobs are kept compressed in cloud storage
+- [x] Incremental tree edit: apply a changeset's changes to the parent's root tree, rewriting only the
+      directories on changed paths (cost grows with the size of the change, not the repo)
 
-## 3. History
-- [x] `CommitGraph`: log (newest first), `isAncestor`, merge base (best common ancestor), objects reachable from
-      a set of commits minus objects reachable from another set (for fetch/push negotiation)
-- [x] Tests: linear history, branches, criss-cross merge base, reachability excludes "haves"
+## 3. RPC plumbing
+- [x] One request/reply envelope, `RpcRequest(method, body)` / `RpcReply(success, error, body)`, over tickloom
+- [x] `RpcNode` base process: `serve(method, body)` and `call(target, method, request)`
+- [x] `ScionApi`: the RPCs that daemon, cache and server all answer
 
-## 4. Diff
-- [x] Line diff (Myers / LCS) with unified-diff output
-- [x] Tree diff: added / modified / deleted paths between two snapshots
-- [x] Tests
+## 4. Spanner (one node; real Spanner runs Paxos per split; same API)
+- [x] Tables of rows: read, insert-if-absent, write, compare-and-swap, scan by prefix
+- [x] Durable on the simulated disk (Journal); reply only once durable
+- [x] Tables used: `refs`, `changesets` (the changeset write-ahead log **[Lite assumption: kept in Spanner]**),
+      `root_tree` (derived data)
 
-## 5. Merge
-- [x] Three-way line merge (diff3) with conflict markers
-- [x] Three-way snapshot merge: per-path rules for add/delete/modify, conflict list
-- [x] Tests: clean merges, conflicting edits, delete/modify conflict, identical edits
+## 5. Cloud storage (one node)
+- [x] Put and get immutable objects by id; durable on the simulated disk
 
-## 6. Durable storage on the tickloom filesystem
-- [x] `RepositoryJournal`: write-ahead log (tickloom `Wal` + `BatchedLog`) of records; recover on open
-- [x] Records are acknowledged only when durable
-- [x] Tests on `SimulatedFileSystem`: survives a crash after sync, loses unsynced writes, torn tail ignored
+## 6. scion-server (several nodes, no long-lived state)
+- [x] Caches immutable objects, changesets and derived data in memory
+- [x] `getObject`, `getChangeset`, `getRootTree` (derived recursively from the first parent; computed on demand,
+      cached, written back to Spanner)
+- [x] `createChangeset` on the server: stores blobs, records the changeset, computes the root tree eagerly
+- [x] `resolveRef`, `listRefs`, `moveRef` (compare-and-swap on one Spanner row, separate from changesets)
+- [x] `log`, `diff`, `mergeBase`
+- [x] `merge` and `rebase` on the server, without locks; conflicts are reported
 
-## 7. Local repository (client side)
-- [x] Working tree (in memory), `add`/`rm`, `status`, `commit` (durable before the id is returned)
-- [x] Branches: create, list, switch (checkout), delete; HEAD
-- [x] `log`, `diff` (working tree vs HEAD, commit vs commit)
-- [x] Local `merge` (fast-forward, three-way, conflicts reported, merge commit with two parents)
-- [x] Remote-tracking refs (`origin/<branch>`)
-- [x] Reopen from disk after a crash: committed history and branches survive
-- [x] Tests on simulated filesystem
+## 7. scion-cache (regional) and scion-daemon (one per workstation)
+- [x] Same RPCs as the server. Immutable objects are served from cache; everything else goes upstream
+- [x] Strict tiers: daemon → its region's cache → servers (spread by object id)
+- [x] Daemon keeps a **bounded** cache (LRU); the cache keeps everything in memory
+- [x] Hit and miss counters
 
-## 8. Replicated server (tickloom `Replica`)
-- [x] Fixed primary + followers. Primary assigns each accepted push a log index, makes it durable locally, then
-      replicates it; a push is acknowledged once a majority has it durable
-- [x] Ref updates are compare-and-set (expected old value) and fast-forward only unless forced
-- [x] Pushes must be complete: every object reachable from the new tips is in the push or on the server
-- [x] Followers accept entries only in order; gaps are filled by the primary (heartbeats carry commit index,
-      followers report their last index)
-- [x] Primary serves requests only after it has re-committed its recovered log (no stale reads after restart)
-- [x] Fetch: list refs + objects reachable from wanted refs minus objects the client already has
-- [x] Recover from the WAL on restart
-- [x] Messages and message types
+## 8. scn client
+- [x] Talks only to its node's daemon
+- [x] Fetch protocol: starts from a root tree and asks for missing trees, then blobs. It never says what it has
+- [x] Sparse checkouts (chosen directories only) and virtual checkouts (files fetched when first read)
+- [x] Working-copy edits tracked by the client (the post's client "monitors for filesystem changes")
+- [x] `commit` = `createChangeset` on the server: nothing to push
+- [x] `land(branch)`: rebase onto the tip, then compare-and-swap the branch; retry if someone moved it,
+      stop on conflicts. No global merge-queue lock
 
-## 9. Remote client (tickloom `ClusterClient`)
-- [x] `listRefs`, `fetch`, `push`
-- [x] Local repo operations `clone`, `fetch`, `pull` (fetch + merge), `push`
+## 9. Tests (simulated network and simulated disks)
+- [x] Unit: changeset encoding, incremental tree edit, compression
+- [x] Spanner: compare-and-swap rules, durability across a crash
+- [x] Cloud storage: durability across a crash
+- [x] Server: create changeset, root tree derived on demand and written back, log, diff, merge base, merge, rebase
+- [x] Tiers: a second workstation in the same region is served from the cache; the daemon's cache is bounded;
+      every tier answers the same RPCs
+- [x] Servers keep no long-lived state: crash a server and another serves; a restarted server starts empty
+- [x] Sparse checkout fetches only the requested trees; virtual checkout fetches a blob on first read
+- [x] Concurrent landings: both land after a rebase; conflicting edits report a conflict
+- [x] Spanner crash and restart: refs and changesets survive
+- [x] Partition between cache and server: requests time out; recovery after healing
+- [x] Randomized: several workstations land at once over a lossy network; every landed changeset is in main
 
-## 10. Distributed tests (simulated network + simulated filesystem)
-- [x] Clone, commit, push, second user clones and sees the history
-- [x] Concurrent pushes to the same branch: one wins, the other is rejected as non-fast-forward; it pulls,
-      merges and pushes again
-- [x] Push succeeds with one follower partitioned; the follower catches up after the partition heals
-- [x] Push fails (times out) when the primary cannot reach a majority, and the ref is not changed
-- [x] Follower crash and restart: recovers its log from disk and catches up
-- [x] Primary crash and restart: acknowledged pushes survive; reads wait until the log is re-committed
-- [x] Client crash: committed local history survives on the client's simulated disk
-- [x] Incomplete push (missing objects) is rejected
-- [x] Randomised scenario with message loss: all replicas converge on the same refs
+## 10. Docs
+- [x] README and mapping.md rewritten; each [Lite assumption] listed
+
+
+## Status
+All items done; `./gradlew test` runs 71 tests.
+
+## Differences from the post
+Checked against the post's text twice. Quoted phrases in the code and docs are verbatim from the post.
+
+### Where Scion Lite departs from what the post says
+- **Bounded object cache.** The post: "The client maintains a bounded local object cache". Scion Lite puts the bounded
+  (LRU) cache in the daemon, and scn keeps no object store of its own.
+- **Daemons everywhere.** The post describes daemons "In the fleet". Every Scion Lite node (called a workstation)
+  has one.
+- **Working copy.** The post's client "lays out the working copy files on disk, monitors for filesystem changes".
+  scn keeps the working copy in memory, and edits go through `write` and `delete`.
+- **Spanner and cloud storage are single nodes.** The post doesn't say how either is built. It never mentions Raft,
+  Paxos or consensus; Paxos replication comes from Google's Spanner paper, not the post.
+- **Derived data.** The post computes all derived data "through one generic mechanism", with blame, path history,
+  commit-graph skip lists, copy detection and path search. Scion Lite has one hand-written kind: the root tree.
+- **Ancestry cost.** With no skip lists, `log`, `mergeBase` and `rebase` walk the history, so they cost more as
+  history grows. The post's requirement that cost "scale with the size of the change" is met by commit creation
+  (`TreeEdit`), not by these calls.
+- **Cache hit rate.** The post: each tier "maintains a cache hit rate of over 99%". Scion Lite counts hits but
+  doesn't measure or target a rate.
+- **Failure isolation.** The post wants to avoid "a failure in a regional scion-cache" overwhelming the servers.
+  Scion Lite has no load shedding or protection of that kind.
+
+### [Lite assumptions] (the post is silent)
+- Changesets are kept in the Spanner `changesets` table (the post: "an entry in a write-ahead log").
+- Changeset ids are the SHA-256 of an encoding of our own (the post: "All source control data is content-addressed").
+  The fields besides parents and changes (author, time, message) are ours too.
+- Author and time come from the client, so a retried create names the same changeset.
+- Trees are stored in cloud storage, compressed with Deflate.
+- Server write order: content made durable in cloud storage, then the changeset row, then the root tree row, then
+  the reply.
+- Caches also cache changesets and root trees, and pass every write through to a server.
+- A cache picks a server by a hash of the request, and skips one that timed out for a while.
+- Each tier waits for a reply for less time than the tier above it (`topology.Timeouts`).
+- Landing is a loop in scn: rebase on the server, compare-and-swap the branch, retry, stop on conflict. The post
+  mentions an "Antique merge queue" but doesn't describe landing.
+- scn remembers landings it couldn't confirm, and rebase takes `since` to replay only later changesets.
+- Rebase drops a replayed changeset that turns out empty.
+
+### Not modelled
+- Antique and its merge queue, and Claude fixing conflicts.
+- IAM and per-directory access control.
+- "Each daemon starts from a periodically refreshed snapshot".
+- Caches that "stream objects directly from memory, in the disk format that the daemon will consume".
+- Server answers about file history and blame.
+
+## Failure scenarios that tickloom makes possible
+Tickloom runs every process in one deterministic tick loop, on a simulated network, with a simulated disk for each
+process. That lets the tests create failures that are hard or impossible to cause on demand, or to replay exactly,
+on real machines.
+
+### Used by the tests
+- **A power cut at an exact tick** (`Cluster.crashNode`). The process stops, and its disk keeps only what was
+  synced: unsynced journal writes are lost. This shows Spanner and cloud storage reply only after data is durable
+  (`FailureTest`).
+- **Restart as a new, empty process on the same disk** (`Cluster.restartNode`). Spanner and cloud storage recover
+  from their journals; a restarted server starts with an empty memory (`FailureTest`, `ServerOperationsTest`).
+- **Partitions between chosen processes** (`partitionNodes`, `healPartition`):
+  - Cache cut off from every server: calls fail, while immutable data the daemon and cache already hold is still
+    served.
+  - Servers cut off from Spanner partway through a commit: the blob is already durable in cloud storage, but no
+    changeset row exists. This is the write-order test.
+- **Seeded packet loss on every link** (`setPacketLoss`). In `RandomizedLandingTest`, a compare-and-swap that took
+  effect but whose reply was lost happens on particular seeds, every time those seeds run. That is how the
+  false-conflict bug in `land` was found and then checked fixed.
+- **Exact replay.** A failing seed reproduces the same run: same message order, same losses, same timeouts.
+- **Time in ticks.** Timeouts and changeset times come from simulated clocks, not wall-clock time.
+
+### Available in tickloom, not used yet
+- One-way partitions (`partitionOneWay`), for example a server that can send to Spanner but not hear back.
+- Dropping one message type, or only the Nth message (`dropMessagesOfType`, `dropNthMessagesOfType`). This could
+  drop exactly the reply to a `moveRef`, instead of waiting for a seed that does it.
+- Per-link delay (`setNetworkDelay`), to make one server slow rather than down.
+- Clock skew per process (`setTimeForProcess`). Changeset times come from the client, so this would show that skew
+  changes ids but not correctness.
+
+### Failures that come from the simplified model, not from Scion
+- Spanner and cloud storage are single nodes, so crashing either one stops the whole system until it restarts. The
+  real services replicate.
+- A crash losing unsynced writes matters only because each service is a single disk.
+- At high loss (15% per link), calls fail with "Request expired" timeouts. Every call crosses four tiers and each
+  tier has a fixed timeout (a [Lite assumption]). No run gave a wrong result, only no result.

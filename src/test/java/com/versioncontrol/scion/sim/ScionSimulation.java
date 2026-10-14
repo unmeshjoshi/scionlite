@@ -1,101 +1,138 @@
 package com.versioncontrol.scion.sim;
 
-import com.versioncontrol.scion.client.ScionClient;
-import com.versioncontrol.scion.repo.Repository;
-import com.versioncontrol.scion.server.ScionServer;
-import com.versioncontrol.scion.server.ScionServerFactory;
 import com.tickloom.ProcessId;
-import com.tickloom.fs.SimulatedFileSystem;
 import com.tickloom.future.TickCompletableFuture;
 import com.tickloom.testkit.Cluster;
+import com.versioncontrol.scion.cache.ScionCache;
+import com.versioncontrol.scion.daemon.ScionDaemon;
+import com.versioncontrol.scion.scn.Scn;
+import com.versioncontrol.scion.server.ScionServer;
+import com.versioncontrol.scion.spanner.Spanner;
+import com.versioncontrol.scion.storage.CloudStorage;
+import com.versioncontrol.scion.topology.ScionNodeFactory;
+import com.versioncontrol.scion.topology.Topology;
+import com.versioncontrol.scion.topology.Timeouts;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.fail;
 
 /**
- * A Scion deployment in simulation: replicas on tickloom's {@link Cluster} (simulated network, a simulated disk
- * each) and workstations whose repositories live on their own simulated disks. {@link #tick()} advances all of it.
+ * Every Scion tier as a tickloom process on one simulated network, each with its own simulated disk.
+ * Workstations are declared when the simulation is built, because each one runs a scion-daemon.
  */
 public class ScionSimulation implements AutoCloseable {
-    public static final ProcessId ALPHA = ProcessId.of("alpha");   // sorts first: the primary
-    public static final ProcessId BETA = ProcessId.of("beta");
-    public static final ProcessId GAMMA = ProcessId.of("gamma");
-    public static final int REQUEST_TIMEOUT_TICKS = 200;
-    private static final int MAX_TICKS = 5000;
+    private static final int MAX_TICKS = 300_000;
 
     private final Cluster cluster;
-    private final List<Workstation> workstations = new ArrayList<>();
+    private final Topology topology;
+    private final Map<String, Scn> scns = new HashMap<>();
 
-    private ScionSimulation(Cluster cluster) {
+    private ScionSimulation(Cluster cluster, Topology topology) {
         this.cluster = cluster;
+        this.topology = topology;
     }
 
-    public static ScionSimulation threeReplicas(long seed) throws IOException {
-        return create(List.of(ALPHA, BETA, GAMMA), seed, false);
+    public static Builder builder() {
+        return new Builder();
     }
 
-    public static ScionSimulation create(List<ProcessId> replicas, long seed, boolean lossy) throws IOException {
-        Cluster cluster = new Cluster()
-                .withProcessIds(replicas)
-                .withSeed(seed)
-                .withRequestTimeoutTicks(REQUEST_TIMEOUT_TICKS)
-                .useSimulatedNetwork(lossy)
-                .build(new ScionServerFactory())
-                .start();
-        return new ScionSimulation(cluster);
+    public static class Builder {
+        private int servers = 2;
+        private final Map<String, List<String>> regions = new LinkedHashMap<>();
+        private ScionServer.DerivedData derivedData = ScionServer.DerivedData.EAGER;
+        private int daemonCapacity = ScionDaemon.DEFAULT_CAPACITY;
+
+        public Builder servers(int servers) {
+            this.servers = servers;
+            return this;
+        }
+
+        /** Root trees are computed when first asked for, not when a changeset is created. */
+        public Builder deferDerivedData() {
+            this.derivedData = ScionServer.DerivedData.DEFERRED;
+            return this;
+        }
+
+        public Builder daemonCapacity(int entries) {
+            this.daemonCapacity = entries;
+            return this;
+        }
+
+        public Builder region(String region, String... workstations) {
+            regions.put(region, List.of(workstations));
+            return this;
+        }
+
+        public ScionSimulation build(long seed) throws IOException {
+            Topology topology = Topology.of(servers, regions);
+            Cluster cluster = new Cluster()
+                    .withProcessIds(topology.allNodes())
+                    .withSeed(seed)
+                    .withRequestTimeoutTicks(Timeouts.SCN)
+                    .useSimulatedNetwork()
+                    .build(new ScionNodeFactory(topology, derivedData, daemonCapacity))
+                    .start();
+            return new ScionSimulation(cluster, topology);
+        }
     }
 
     public Cluster cluster() {
         return cluster;
     }
 
-    public ScionServer server(ProcessId id) {
-        return cluster.getNode(id);
+    public Topology topology() {
+        return topology;
+    }
+
+    /** The scn client on a workstation, created on first use and connected only to that workstation's daemon. */
+    public Scn scn(String workstation) throws IOException {
+        Scn scn = scns.get(workstation);
+        if (scn == null) {
+            ProcessId daemon = Topology.daemon(workstation);
+            if (!topology.regionByDaemon().containsKey(daemon)) {
+                throw new IllegalArgumentException("no workstation " + workstation);
+            }
+            scn = cluster.newClientConnectedTo(Topology.scn(workstation), daemon, Scn::new);
+            scns.put(workstation, scn);
+        }
+        return scn;
+    }
+
+    public Spanner spanner() {
+        return cluster.getNode(topology.spanner());
+    }
+
+    public CloudStorage cloudStorage() {
+        return cluster.getNode(topology.cloudStorage());
+    }
+
+    public ScionServer server(int n) {
+        return cluster.getNode(Topology.server(n));
     }
 
     public List<ScionServer> servers() {
-        return cluster.getServerProcessIds().stream().map(this::server).toList();
+        List<ScionServer> servers = new ArrayList<>();
+        topology.servers().forEach(id -> servers.add(cluster.getNode(id)));
+        return servers;
     }
 
-    /** A workstation with an empty repository. */
-    public Workstation workstation(String name) throws IOException {
-        Workstation workstation = newWorkstation(name);
-        workstation.repo = new Repository(workstation.disk, name, workstation.clock);
-        await(workstation.repo.open());
-        return workstation;
+    public ScionCache cache(String region) {
+        return cluster.getNode(Topology.cache(region));
     }
 
-    /** A workstation that clones the repository from the servers. */
-    public Workstation cloneTo(String name) throws IOException {
-        Workstation workstation = newWorkstation(name);
-        workstation.repo = new Repository(workstation.disk, name, workstation.clock);
-        await(workstation.repo.cloneFrom(workstation.client));
-        return workstation;
-    }
-
-    private Workstation newWorkstation(String name) throws IOException {
-        ProcessId id = ProcessId.of(name);
-        ScionClient client = cluster.newClient(id, ScionClient::new);
-        Workstation workstation = new Workstation(id, client, new SimulatedFileSystem(), cluster.getClockForProcess(id));
-        workstations.add(workstation);
-        return workstation;
-    }
-
-    /** Power cut on the workstation, then the repository is opened again from what reached its disk. */
-    public void crashAndReopen(Workstation workstation) {
-        workstation.disk.crash();
-        workstation.disk.restart();
-        workstation.repo = new Repository(workstation.disk, workstation.id.name(), workstation.clock);
-        await(workstation.repo.open());
+    public ScionDaemon daemon(String workstation) {
+        return cluster.getNode(Topology.daemon(workstation));
     }
 
     public void tick() {
         cluster.tick();
-        workstations.forEach(Workstation::tick);
     }
 
     public void tick(int ticks) {

@@ -1,7 +1,7 @@
 package com.versioncontrol.scion.objects;
 
 public enum ObjectType {
-    BLOB("blob"), TREE("tree"), COMMIT("commit");
+    BLOB("blob"), TREE("tree");
 
     private final String label;
 

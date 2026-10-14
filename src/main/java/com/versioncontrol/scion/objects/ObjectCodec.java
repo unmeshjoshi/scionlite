@@ -47,7 +47,6 @@ public final class ObjectCodec {
         return switch (type) {
             case BLOB -> new Blob(content);
             case TREE -> Tree.parse(content);
-            case COMMIT -> Commit.parse(content);
         };
     }
 
