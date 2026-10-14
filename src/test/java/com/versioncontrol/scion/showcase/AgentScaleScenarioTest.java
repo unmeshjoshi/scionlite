@@ -44,10 +44,11 @@ import static org.junit.jupiter.api.Assertions.*;
  * </pre>
  */
 class AgentScaleScenarioTest {
-    private static final String APP = "line 1\nline 2\nline 3\nline 4\nline 5\n";
+    /** The content of src/app.txt when main is seeded; the agents edit its first and last lines. */
+    private static final String ORIGINAL_APP_FILE_CONTENT = "line 1\nline 2\nline 3\nline 4\nline 5\n";
     private static final Map<String, String> MONOREPO = Map.of(
             "README.md", "the monorepo\n",
-            "src/app.txt", APP,
+            "src/app.txt", ORIGINAL_APP_FILE_CONTENT,
             "src/util.txt", "helpers\n",
             "docs/guide.txt", "how to use it\n",
             "infra/deploy.txt", "deploy steps\n",
@@ -70,18 +71,18 @@ class AgentScaleScenarioTest {
 
             // 1. Sparse checkout of src/: "only contain the directories the client asks for".
             sim.await(agent.checkoutSparse(main, List.of("src")));
-            assertEquals(Map.of("src/app.txt", APP, "src/util.txt", "helpers\n"), agent.files());
+            assertEquals(Map.of("src/app.txt", ORIGINAL_APP_FILE_CONTENT, "src/util.txt", "helpers\n"), agent.files());
             assertEquals(4, agent.objectRequests(), "the root and src trees, and src's two files");
-            agent.write("src/app.txt", APP.replace("line 1", "line 1 by alice"));
+            agent.write("src/app.txt", ORIGINAL_APP_FILE_CONTENT.replace("line 1", "line 1 by alice"));
             sim.await(agent.commit("alice: change line 1"));
 
             // 2. Virtual checkout: files are materialized "on demand". The west cache already holds what alice fetched.
             long serverRequestsBefore = serverRequests(sim);
             sim.await(bobAgent.checkoutVirtual(main));
-            assertEquals(APP, sim.await(bobAgent.read("src/app.txt")));
+            assertEquals(ORIGINAL_APP_FILE_CONTENT, sim.await(bobAgent.read("src/app.txt")));
             assertEquals(3, bobAgent.objectRequests(), "the root tree, the src tree and one file");
             assertEquals(serverRequestsBefore, serverRequests(sim), "the west cache answered bob's fetches");
-            bobAgent.write("src/app.txt", APP.replace("line 5", "line 5 by bob"));
+            bobAgent.write("src/app.txt", ORIGINAL_APP_FILE_CONTENT.replace("line 5", "line 5 by bob"));
             sim.await(bobAgent.commit("bob: change line 5"));
 
             // 3. "many write workloads can also skip the checkout and function entirely via API"
@@ -93,7 +94,7 @@ class AgentScaleScenarioTest {
             long forwardedBefore = sim.daemon("alice").forwardedUpstream();
             sim.await(secondAgent.checkoutSparse(main, List.of("src")));
             assertEquals(forwardedBefore, sim.daemon("alice").forwardedUpstream(), "nothing went past alice's daemon");
-            secondAgent.write("src/app.txt", APP.replace("line 1", "line 1 by agent-2"));
+            secondAgent.write("src/app.txt", ORIGINAL_APP_FILE_CONTENT.replace("line 1", "line 1 by agent-2"));
             sim.await(secondAgent.commit("agent-2: change line 1"));
 
             // 5. Three landings at once, with no "global repository lock on the merge queue".

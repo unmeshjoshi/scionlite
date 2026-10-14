@@ -37,7 +37,8 @@ import static org.junit.jupiter.api.Assertions.*;
  * </pre>
  */
 class ShowcaseTest {
-    private static final String FILE_CONTENT = "line 1\nline 2\nline 3\nline 4\nline 5\n";
+    /** The content of src/app.txt when main is seeded; bob and carol edit its first and last lines. */
+    private static final String ORIGINAL_APP_FILE_CONTENT = "line 1\nline 2\nline 3\nline 4\nline 5\n";
 
     private static long serverRequests(ScionSimulation sim) {
         return sim.servers().stream().mapToLong(ScionServer::requestsServed).sum();
@@ -52,7 +53,7 @@ class ShowcaseTest {
             // 1. alice seeds the repository and lands it on main.
             //    "moving one is a compare-and-swap on a single Spanner row"
             alice.write("README.md", "Scion Lite\n");
-            alice.write("src/app.txt", FILE_CONTENT);
+            alice.write("src/app.txt", ORIGINAL_APP_FILE_CONTENT);
             alice.write("docs/guide.txt", "how to use it\n");
             String seed = sim.await(alice.commit("seed"));
             assertEquals(seed, sim.await(alice.land("main")));
@@ -62,7 +63,7 @@ class ShowcaseTest {
             //    "When a cache is missing an object, it asks the authoritative scion-servers"; here it is not missing.
             long serverRequestsBefore = serverRequests(sim);
             sim.await(bob.checkout(seed));
-            assertEquals(Map.of("README.md", "Scion Lite\n", "src/app.txt", FILE_CONTENT, "docs/guide.txt", "how to use it\n"),
+            assertEquals(Map.of("README.md", "Scion Lite\n", "src/app.txt", ORIGINAL_APP_FILE_CONTENT, "docs/guide.txt", "how to use it\n"),
                     bob.files());
             assertEquals(serverRequestsBefore, serverRequests(sim), "bob's checkout never reached a server");
             assertTrue(sim.cache("west").hits() > 0);
@@ -70,18 +71,18 @@ class ShowcaseTest {
             // 3. carol makes a virtual checkout: "the client simply doesn't ask for trees it doesn't want".
             sim.await(carol.checkoutVirtual(seed));
             assertEquals(0, carol.objectRequests(), "a virtual checkout fetches nothing up front");
-            assertEquals(FILE_CONTENT, sim.await(carol.read("src/app.txt")));
+            assertEquals(ORIGINAL_APP_FILE_CONTENT, sim.await(carol.read("src/app.txt")));
             assertEquals(3, carol.objectRequests(), "the root tree, the src tree and one blob");
 
             // 4. Both commit. "every commit, rebase, or merge happens on the server, so there's nothing to push"
             //    "a changeset stores a list of the files that changed relative to its first parent"
-            bob.write("src/app.txt", FILE_CONTENT.replace("line 1", "line 1 by bob"));
-            carol.write("src/app.txt", FILE_CONTENT.replace("line 5", "line 5 by carol"));
+            bob.write("src/app.txt", ORIGINAL_APP_FILE_CONTENT.replace("line 1", "line 1 by bob"));
+            carol.write("src/app.txt", ORIGINAL_APP_FILE_CONTENT.replace("line 5", "line 5 by carol"));
             String bobsCommit = sim.await(bob.commit("bob's edit"));
             String carolsCommit = sim.await(carol.commit("carol's edit"));
             assertEquals(List.of("src/app.txt"),
                     sim.await(alice.getChangeset(bobsCommit)).changes().stream().map(FileChange::path).toList());
-            assertEquals(FILE_CONTENT.replace("line 1", "line 1 by bob"),
+            assertEquals(ORIGINAL_APP_FILE_CONTENT.replace("line 1", "line 1 by bob"),
                     sim.await(alice.readAllFiles(bobsCommit)).get("src/app.txt"), "alice sees bob's commit at once");
 
             // 5. bob and carol land at the same time. No "global repository lock on the merge queue".
