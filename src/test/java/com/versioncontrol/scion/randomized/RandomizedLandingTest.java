@@ -23,15 +23,24 @@ import static org.junit.jupiter.api.Assertions.*;
  * every changeset reported landed is in main's history, and main ends with each workstation's last landed file.
  */
 class RandomizedLandingTest {
-    private static final List<String> WORKSTATIONS = List.of("ada", "bob", "cy", "dee");
+    private static final List<String> WORKSTATIONS = List.of("alice", "bob", "carol", "dave");
     private static final int ROUNDS = 3;
     private static final double LOSS = 0.05;
 
+    /**
+     * Scenario: four workstations in two regions, three servers, and 5% packet loss on every link.
+     * 1. In each of three rounds, every workstation writes its own file, commits (retrying on timeouts),
+     *    and all four land on main at the same time.
+     * 2. Some landings time out. A timed-out landing may still have happened, so it is not counted either way.
+     * 3. The network is made reliable again.
+     * Then every landing reported as successful is in main's history, no landing reported a conflict,
+     * and each workstation's file in main is at least as new as its last reported landing.
+     */
     @ParameterizedTest
     @ValueSource(longs = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, })
     void everyReportedLandingIsInMain(long seed) throws Exception {
         try (ScionSimulation sim = ScionSimulation.builder().servers(3)
-                .region("west", "ada", "bob").region("east", "cy", "dee").build(seed)) {
+                .region("west", "alice", "bob").region("east", "carol", "dave").build(seed)) {
             Map<String, Scn> scns = new LinkedHashMap<>();
             for (String ws : WORKSTATIONS) {
                 scns.put(ws, sim.scn(ws));
@@ -74,12 +83,12 @@ class RandomizedLandingTest {
             }
 
             sim.cluster().resetNetworkConditions();
-            Scn ada = scns.get("ada");
-            String main = sim.await(ada.resolveRef("main"));
-            List<String> history = sim.await(ada.log(main, 0));
+            Scn alice = scns.get("alice");
+            String main = sim.await(alice.resolveRef("main"));
+            List<String> history = sim.await(alice.log(main, 0));
             assertTrue(history.containsAll(reportedLanded), "landed changesets missing from main");
             assertFalse(reportedLanded.isEmpty(), "nothing landed at 5% loss");
-            Map<String, String> files = sim.await(ada.readAllFiles(main));
+            Map<String, String> files = sim.await(alice.readAllFiles(main));
             // A later land that did happen but whose reply was lost can only make a file newer, never older.
             lastLandedContent.forEach((ws, text) -> {
                 String actual = files.get(ws + ".txt");

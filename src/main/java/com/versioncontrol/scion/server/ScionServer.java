@@ -20,7 +20,9 @@ import com.versioncontrol.scion.objects.ObjectStore;
 import com.versioncontrol.scion.objects.ScionObject;
 import com.versioncontrol.scion.rpc.RpcException;
 import com.versioncontrol.scion.rpc.RpcNode;
+import com.versioncontrol.scion.spanner.Schema;
 import com.versioncontrol.scion.spanner.SpannerApi;
+import com.versioncontrol.scion.spanner.SpannerApi.*;
 import com.versioncontrol.scion.storage.CloudStorageApi;
 import com.versioncontrol.scion.topology.Topology;
 import com.versioncontrol.scion.tree.TreeEdit;
@@ -30,6 +32,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.Collection;
 import java.util.Deque;
 import java.util.HashMap;
@@ -40,6 +43,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.function.Function;
 
 /**
  * The authoritative tier. The post: caches ask "the authoritative scion-servers, which read from Spanner or cloud
@@ -61,6 +65,9 @@ import java.util.TreeMap;
  * </ul>
  */
 public class ScionServer extends RpcNode {
+    /** Read-write transactions on a ref that Spanner aborts are retried this many times. [Lite assumption] */
+    public static final int MAX_TRANSACTION_ATTEMPTS = 10;
+
     /**
      * The post: "for each type, we can choose whether to compute it eagerly or defer the work". Eager: a changeset's
      * root tree is computed and written when the changeset is created. Deferred: it is computed the first time someone
@@ -73,6 +80,9 @@ public class ScionServer extends RpcNode {
     private final ObjectStore objects = new ObjectStore();
     private final Map<String, Changeset> changesets = new HashMap<>();
     private final Map<String, ObjectId> rootTrees = new HashMap<>();
+    /** Spanner sessions not in use. A session runs one transaction at a time, so each call takes one. */
+    private final Deque<String> freeSessions = new ArrayDeque<>();
+    private long sessionsCreated;
     private final TreeWalker walker;
     private long requestsServed;
     private long rootTreesComputed;
@@ -122,11 +132,11 @@ public class ScionServer extends RpcNode {
         if (cached != null) {
             return TickCompletableFuture.completed(cached);
         }
-        return spannerRead(SpannerApi.CHANGESETS, id).thenApply(bytes -> {
-            if (bytes == null) {
+        return readRow(SpannerApi.CHANGESETS, Schema.CHANGESETS_COLUMNS, id).thenApply(row -> {
+            if (row == null) {
                 throw new RpcException("no such changeset " + id);
             }
-            Changeset changeset = Changeset.decode(bytes);
+            Changeset changeset = Changeset.decode(Base64.getDecoder().decode(row.get(1)));
             if (!changeset.id().equals(id)) {
                 throw new RpcException("changeset row " + id + " holds " + changeset.id());
             }
@@ -153,9 +163,9 @@ public class ScionServer extends RpcNode {
             if (known != null) {
                 return TickCompletableFuture.completed(new WalkBack(null, walk.toCompute(), known, true));
             }
-            return spannerRead(SpannerApi.ROOT_TREE, walk.next()).thenCompose(row -> {
+            return readRow(SpannerApi.ROOT_TREE, Schema.ROOT_TREE_COLUMNS, walk.next()).thenCompose(row -> {
                 if (row != null) {
-                    ObjectId tree = ObjectId.of(new String(row, StandardCharsets.UTF_8));
+                    ObjectId tree = ObjectId.of(row.get(1));
                     rootTrees.put(walk.next(), tree);
                     return TickCompletableFuture.completed(new WalkBack(null, walk.toCompute(), tree, true));
                 }
@@ -193,10 +203,10 @@ public class ScionServer extends RpcNode {
     }
 
     private TickCompletableFuture<ObjectId> writeRootTree(String changesetId, ObjectId root) {
-        return call(topology.spanner(), SpannerApi.WRITE,
-                new SpannerApi.WriteRequest(SpannerApi.ROOT_TREE, changesetId, root.hex().getBytes(StandardCharsets.UTF_8)),
-                SpannerApi.WriteReply.class)
-                .thenApply(written -> {
+        Mutation write = Mutation.insertOrUpdate(SpannerApi.ROOT_TREE, Schema.ROOT_TREE_COLUMNS,
+                List.of(changesetId, root.hex()));
+        return commitSingleUse(List.of(write))
+                .thenApply(committed -> {
                     rootTrees.put(changesetId, root);
                     return root;
                 });
@@ -242,7 +252,8 @@ public class ScionServer extends RpcNode {
 
     /**
      * Records a changeset built on this server. Blobs first, then (eagerly) its trees, then the Spanner row, then
-     * the root tree row. Inserting an equal row again is fine: the id is the content.
+     * the root tree row. Each Spanner write is a single-use Commit. An insert that fails with ALREADY_EXISTS is fine
+     * if the row holds the same changeset: the id is the content, so a retried create inserts the same row.
      */
     private TickCompletableFuture<String> persist(Changeset changeset, List<ScionObject> newBlobs, ObjectId parentRoot) {
         String id = changeset.id();
@@ -251,12 +262,8 @@ public class ScionServer extends RpcNode {
                 .thenCompose(ignored -> derivedData == DerivedData.EAGER
                         ? computeRootTree(parentRoot, changeset)
                         : TickCompletableFuture.<ObjectId>completed(null))
-                .thenCompose(root -> call(topology.spanner(), SpannerApi.INSERT,
-                        new SpannerApi.InsertRequest(SpannerApi.CHANGESETS, id, encoded), SpannerApi.InsertReply.class)
-                        .thenCompose(insert -> {
-                            if (!insert.inserted() && !Arrays.equals(insert.existing(), encoded)) {
-                                throw new RpcException("changeset " + id + " exists with other content");
-                            }
+                .thenCompose(root -> insertChangeset(id, encoded)
+                        .thenCompose(inserted -> {
                             changesets.put(id, changeset);
                             return root == null ? TickCompletableFuture.completed(null) : writeRootTree(id, root);
                         }))
@@ -267,28 +274,77 @@ public class ScionServer extends RpcNode {
 
     private TickCompletableFuture<RefsReply> listRefs(ListRefsRequest request) {
         String prefix = request.prefix() == null ? "" : request.prefix();
-        return call(topology.spanner(), SpannerApi.SCAN, new SpannerApi.ScanRequest(SpannerApi.REFS, prefix),
-                SpannerApi.ScanReply.class)
-                .thenApply(scan -> {
+        return withSession(session -> call(topology.spanner(), SpannerApi.READ, ReadRequest.strong(session,
+                        SpannerApi.REFS, Schema.REFS_COLUMNS, KeySet.range(KeyRange.prefix(prefix))), ResultSet.class))
+                .thenApply(result -> {
                     Map<String, String> refs = new TreeMap<>();
-                    scan.rows().forEach((name, value) -> refs.put(name, new String(value, StandardCharsets.UTF_8)));
+                    result.rows().forEach(row -> refs.put(row.get(0), row.get(1)));
                     return new RefsReply(refs);
                 });
     }
 
     private TickCompletableFuture<String> resolveRef(String name) {
-        return spannerRead(SpannerApi.REFS, name)
-                .thenApply(value -> value == null ? null : new String(value, StandardCharsets.UTF_8));
+        return readRow(SpannerApi.REFS, Schema.REFS_COLUMNS, name).thenApply(row -> row == null ? null : row.get(1));
     }
 
-    /** A compare-and-swap on the ref's row. The target must be a changeset that exists. */
+    /**
+     * The post: moving a ref "is a compare-and-swap on a single Spanner row". Spanner has no compare-and-swap call,
+     * so it is a read-write transaction: Read the ref's row (beginning the transaction), compare it with
+     * {@code expected} here, then Commit the new value, or Roll back if it differs. Commit returns ABORTED if
+     * another transaction changed the row in between; then the whole transaction is retried, as the reference says
+     * to. The target must be a changeset that exists.
+     */
     private TickCompletableFuture<MoveRefReply> moveRef(MoveRefRequest request) {
-        return changeset(request.target()).thenCompose(target -> call(topology.spanner(), SpannerApi.COMPARE_AND_SWAP,
-                new SpannerApi.CompareAndSwapRequest(SpannerApi.REFS, request.name(), utf8(request.expected()),
-                        utf8(request.target())),
-                SpannerApi.CompareAndSwapReply.class))
-                .thenApply(cas -> new MoveRefReply(cas.swapped(),
-                        cas.current() == null ? null : new String(cas.current(), StandardCharsets.UTF_8)));
+        record Attempt(int number, MoveRefReply reply) {
+        }
+        return changeset(request.target()).thenCompose(target -> Futures.loop(new Attempt(0, null),
+                attempt -> attempt.reply() != null, attempt -> {
+                    if (attempt.number() == MAX_TRANSACTION_ATTEMPTS) {
+                        throw new RpcException("moveRef " + request.name() + ": aborted "
+                                + MAX_TRANSACTION_ATTEMPTS + " times");
+                    }
+                    TickCompletableFuture<Attempt> next = new TickCompletableFuture<>();
+                    compareAndSwapRef(request).whenComplete((reply, error) -> {
+                        if (error == null) {
+                            next.complete(new Attempt(attempt.number() + 1, reply));
+                        } else if (SpannerApi.code(error) == Code.ABORTED
+                                || SpannerApi.code(error) == Code.ALREADY_EXISTS) {
+                            next.complete(new Attempt(attempt.number() + 1, null));
+                        } else {
+                            next.fail(error);
+                        }
+                    });
+                    return next;
+                }).thenApply(Attempt::reply));
+    }
+
+    /**
+     * One read-write transaction, in a session of its own. ALREADY_EXISTS: another transaction created the ref first.
+     * If the row differs, the answer is known before Rollback, so a lost Rollback reply doesn't fail the call; an
+     * unfinished transaction is dropped by Spanner when its session starts another or when it sits idle.
+     */
+    private TickCompletableFuture<MoveRefReply> compareAndSwapRef(MoveRefRequest request) {
+        return withSession(session -> {
+            ReadRequest read = new ReadRequest(session, TransactionSelector.begin(TransactionOptions.optimisticReadWrite()),
+                    SpannerApi.REFS, Schema.REFS_COLUMNS, KeySet.key(request.name()), 0);
+            return call(topology.spanner(), SpannerApi.READ, read, ResultSet.class).thenCompose(result -> {
+                String transaction = result.metadata().transaction().id();
+                String current = result.rows().isEmpty() ? null : result.rows().get(0).get(1);
+                if (!Objects.equals(current, request.expected())) {
+                    MoveRefReply notSwapped = new MoveRefReply(false, current);
+                    TickCompletableFuture<MoveRefReply> answered = new TickCompletableFuture<>();
+                    call(topology.spanner(), SpannerApi.ROLLBACK, new RollbackRequest(session, transaction), Empty.class)
+                            .whenComplete((ignored, error) -> answered.complete(notSwapped));
+                    return answered;
+                }
+                List<String> row = List.of(request.name(), request.target());
+                Mutation write = current == null
+                        ? Mutation.insert(SpannerApi.REFS, Schema.REFS_COLUMNS, row)
+                        : Mutation.update(SpannerApi.REFS, Schema.REFS_COLUMNS, row);
+                return call(topology.spanner(), SpannerApi.COMMIT, CommitRequest.of(session, transaction, List.of(write)),
+                        CommitResponse.class).thenApply(committed -> new MoveRefReply(true, request.target()));
+            });
+        });
     }
 
     // ---- History ----
@@ -527,9 +583,92 @@ public class ScionServer extends RpcNode {
 
     // ---- Spanner and cloud storage ----
 
-    private TickCompletableFuture<byte[]> spannerRead(String table, String key) {
-        return call(topology.spanner(), SpannerApi.READ, new SpannerApi.ReadRequest(table, key),
-                SpannerApi.ReadReply.class).thenApply(SpannerApi.ReadReply::value);
+    /**
+     * Runs {@code work} in a Spanner session from the pool, creating one if none is free, and returns the session to
+     * the pool afterwards. If Spanner has deleted the session (it restarted), the session is dropped and the work is
+     * tried once more in a new one.
+     */
+    private <T> TickCompletableFuture<T> withSession(Function<String, TickCompletableFuture<T>> work) {
+        TickCompletableFuture<T> result = new TickCompletableFuture<>();
+        inSession(work).whenComplete((value, error) -> {
+            if (error == null) {
+                result.complete(value);
+            } else if (SpannerApi.sessionNotFound(error)) {
+                inSession(work).whenComplete((retried, retryError) -> {
+                    if (retryError == null) {
+                        result.complete(retried);
+                    } else {
+                        result.fail(retryError);
+                    }
+                });
+            } else {
+                result.fail(error);
+            }
+        });
+        return result;
+    }
+
+    /** One try: a deleted session is not returned to the pool. */
+    private <T> TickCompletableFuture<T> inSession(Function<String, TickCompletableFuture<T>> work) {
+        TickCompletableFuture<String> session = freeSessions.isEmpty()
+                ? call(topology.spanner(), SpannerApi.CREATE_SESSION, CreateSessionRequest.of(SpannerApi.DATABASE),
+                        Session.class).thenApply(created -> {
+                            sessionsCreated++;
+                            return created.name();
+                        })
+                : TickCompletableFuture.completed(freeSessions.pop());
+        return session.thenCompose(name -> {
+            TickCompletableFuture<T> done = new TickCompletableFuture<>();
+            work.apply(name).whenComplete((value, error) -> {
+                if (error == null || !SpannerApi.sessionNotFound(error)) {
+                    freeSessions.push(name);
+                }
+                if (error == null) {
+                    done.complete(value);
+                } else {
+                    done.fail(error);
+                }
+            });
+            return done;
+        });
+    }
+
+    /** A strong single-use Read of one row: its values in {@code columns} order, or null. */
+    private TickCompletableFuture<List<String>> readRow(String table, List<String> columns, String key) {
+        return withSession(session -> call(topology.spanner(), SpannerApi.READ,
+                ReadRequest.strong(session, table, columns, KeySet.key(key)), ResultSet.class))
+                .thenApply(result -> result.rows().isEmpty() ? null : result.rows().get(0));
+    }
+
+    /** Not idempotent in Spanner; every caller writes rows whose content depends only on their key. */
+    private TickCompletableFuture<CommitResponse> commitSingleUse(List<Mutation> mutations) {
+        return withSession(session -> call(topology.spanner(), SpannerApi.COMMIT,
+                CommitRequest.singleUse(session, mutations), CommitResponse.class));
+    }
+
+    /** Inserts the changeset row. If it is already there, it must hold the same bytes. */
+    private TickCompletableFuture<Void> insertChangeset(String id, byte[] encoded) {
+        String body = Base64.getEncoder().encodeToString(encoded);
+        TickCompletableFuture<Void> done = new TickCompletableFuture<>();
+        commitSingleUse(List.of(Mutation.insert(SpannerApi.CHANGESETS, Schema.CHANGESETS_COLUMNS,
+                List.of(id, body)))).whenComplete((committed, error) -> {
+            if (error == null) {
+                done.complete(null);
+            } else if (SpannerApi.code(error) != Code.ALREADY_EXISTS) {
+                done.fail(error);
+            } else {
+                readRow(SpannerApi.CHANGESETS, Schema.CHANGESETS_COLUMNS, id).whenComplete((row, readError) -> {
+                    if (readError != null) {
+                        done.fail(readError);
+                    } else if (row == null || !row.get(1).equals(body)) {
+                        done.fail(new RpcException("changeset " + id + " exists with other content"));
+                    } else {
+                        done.complete(null);
+                    }
+                });
+            }
+        });
+        return done;
     }
 
     /** Objects are stored compressed, keyed by id. Completes once all are durable. */
@@ -561,10 +700,6 @@ public class ScionServer extends RpcNode {
                 });
     }
 
-    private static byte[] utf8(String value) {
-        return value == null ? null : value.getBytes(StandardCharsets.UTF_8);
-    }
-
     private static String shortId(String id) {
         return id == null ? "none" : id.substring(0, Math.min(10, id.length()));
     }
@@ -583,5 +718,10 @@ public class ScionServer extends RpcNode {
     /** Immutable data held in memory. A restarted server starts with none. */
     public int cachedObjects() {
         return objects.size() + changesets.size() + rootTrees.size();
+    }
+
+    /** Spanner sessions this server has created since it started. */
+    public long sessionsCreated() {
+        return sessionsCreated;
     }
 }

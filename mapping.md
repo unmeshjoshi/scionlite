@@ -20,9 +20,10 @@ Source root: `src/main/java/com/versioncontrol/scion/`.
 | `scion-cache`, regional: "When a cache is missing an object, it asks the authoritative scion-servers" | `cache.ScionCache` | **[Lite assumption]** It spreads calls over servers by a hash of the request, and skips a server that timed out for a while. The post calls caches "the tree and blob cache servers"; **[Lite assumption]** they also cache changesets and root trees ("All source control data is content-addressed, so ... any server can cache it"), and pass every write through to a server. |
 | `scion-server`, authoritative, "essentially large caches that can also compute derived data" | `server.ScionServer` | Keeps immutable data in memory only; a restarted server starts empty. The post: each tier "does not require long-lived state". Its "cache hit rate of over 99%" is not measured here. |
 | "The scion-daemon, scion-cache, and scion-server all respond to identical RPCs for this protocol" | `api.ScionApi` | All three implement `RpcNode.serve` for the same method names. |
-| Spanner | `spanner.Spanner`, `spanner.SpannerApi` | **One node**, durable through a journal, with the same kind of API. The post does not mention Raft, Paxos or consensus; Paxos replication comes from Google's Spanner paper, not the post. |
+| Spanner | `spanner.Spanner`, `spanner.SpannerApi`, `spanner.Schema` | **One node**, durable through a journal. Its calls are `CreateSession`, `Read`, `BeginTransaction`, `Commit` and `Rollback` from Google's `google.spanner.v1` RPC reference, not from the post (see the README). The post does not mention Raft, Paxos or consensus; Paxos replication comes from Google's Spanner paper, not the post. |
 | "the compressed file contents in blob storage"; servers "read from Spanner or cloud storage as needed" | `storage.CloudStorage`, `changeset.Compression` | One node; first write wins. **[Lite assumption]** Deflate. |
 | "Any tier could theoretically talk to any other, but we strictly enforce the tiering to isolate failure domains" | `topology.Topology` | Who may call whom. `TiersTest` connects test clients straight to a cache and a server only to show they answer the same calls. |
+| The post names no RPCs | `api.ScionApi` names (`createChangeset`, `RebaseRequest`, ...) | **[Lite assumption]** Every Scion call and message name is Scion Lite's own. Only the operations come from the post. |
 | — | `topology.Timeouts` | **[Lite assumption]** Each tier waits less than the tier above it, so a cache can try another server before the client gives up. |
 
 ## Data model
@@ -37,7 +38,7 @@ Source root: `src/main/java/com/versioncontrol/scion/`.
 | Author and time | `CreateChangesetRequest.author`, `.time` | **[Lite assumption]** Supplied by the client, so a retry names the same changeset. |
 | Trees | `objects.Tree`, stored in cloud storage | **[Lite assumption]** The post mentions root trees and recursive tree fetches but not where trees are stored. |
 | Refs are discouraged "except for the main ref or release branches" | Rows of the Spanner `refs` table | |
-| "moving one is a compare-and-swap on a single Spanner row that happens separately from creating changesets" | `ScionServer.moveRef` → `SpannerApi.COMPARE_AND_SWAP` | |
+| "moving one is a compare-and-swap on a single Spanner row that happens separately from creating changesets" | `ScionServer.moveRef` | Spanner has no compare-and-swap call, so the server runs a read-write transaction on the ref's row: `Read` (beginning the transaction), compare, then `Commit` or `Rollback`, retrying on `ABORTED`. |
 
 ## Derived data and server-side operations
 

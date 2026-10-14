@@ -14,7 +14,7 @@ class ChangesetTest {
 
     @Test
     void encodesAndDecodesToTheSameChangesetWithTheSameId() {
-        Changeset changeset = new Changeset(List.of(P1, P2), "ada", 42, "line one\nline two\n",
+        Changeset changeset = new Changeset(List.of(P1, P2), "alice", 42, "line one\nline two\n",
                 List.of(FileChange.write("src/Main.java", Blob.of("x").id()), FileChange.delete("README.md")));
 
         Changeset decoded = Changeset.decode(changeset.encode());
@@ -28,17 +28,17 @@ class ChangesetTest {
     void theIdIsTheContentSoChangeOrderDoesNotMatterButAnyFieldDoes() {
         FileChange a = FileChange.write("a", Blob.of("1").id());
         FileChange b = FileChange.delete("b");
-        Changeset one = new Changeset(List.of(P1), "ada", 1, "m", List.of(a, b));
-        Changeset two = new Changeset(List.of(P1), "ada", 1, "m", List.of(b, a));
+        Changeset one = new Changeset(List.of(P1), "alice", 1, "m", List.of(a, b));
+        Changeset two = new Changeset(List.of(P1), "alice", 1, "m", List.of(b, a));
 
         assertEquals(one.id(), two.id());
-        assertNotEquals(one.id(), new Changeset(List.of(P1), "ada", 2, "m", List.of(a, b)).id());
-        assertNotEquals(one.id(), new Changeset(List.of(P2), "ada", 1, "m", List.of(a, b)).id());
+        assertNotEquals(one.id(), new Changeset(List.of(P1), "alice", 2, "m", List.of(a, b)).id());
+        assertNotEquals(one.id(), new Changeset(List.of(P2), "alice", 1, "m", List.of(a, b)).id());
     }
 
     @Test
     void rejectsAPathChangedTwiceAndInvalidPaths() {
-        assertThrows(IllegalArgumentException.class, () -> new Changeset(List.of(), "ada", 1, "m",
+        assertThrows(IllegalArgumentException.class, () -> new Changeset(List.of(), "alice", 1, "m",
                 List.of(FileChange.delete("a"), FileChange.write("a", Blob.of("1").id()))));
         assertThrows(IllegalArgumentException.class, () -> FileChange.delete("a//b"));
         assertThrows(IllegalArgumentException.class, () -> FileChange.delete("../etc/passwd"));

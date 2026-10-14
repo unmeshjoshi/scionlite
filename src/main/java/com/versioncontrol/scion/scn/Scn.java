@@ -397,7 +397,18 @@ public class Scn extends ClusterClient {
         if (head == null) {
             return Futures.failed(new IllegalStateException("nothing to land"));
         }
-        String change = head;
+        return landChangeset(branch, head).thenCompose(landed -> {
+            head = landed;   // landed, even if refreshing the working copy below fails
+            headRoot = null;
+            return checkout(landed, mode, sparseDirectories).thenApply(ignored -> landed);
+        });
+    }
+
+    /**
+     * Lands {@code change} on {@code branch} without a working copy, entirely through server calls: the post says
+     * "many write workloads can also skip the checkout and function entirely via API". Same steps as {@link #land}.
+     */
+    public TickCompletableFuture<String> landChangeset(String branch, String change) {
         return Futures.loop(new LandAttempt(0, null, null), LandAttempt::finished, attempt -> {
             if (attempt.attempts() >= MAX_LAND_ATTEMPTS) {
                 throw new IllegalStateException("could not land on " + branch + " after " + attempt.attempts()
@@ -408,14 +419,12 @@ public class Scn extends ClusterClient {
                 next.complete(error == null ? result : new LandAttempt(attempt.attempts() + 1, null, null));
             });
             return next;
-        }).thenCompose(result -> {
+        }).thenApply(result -> {
             if (result.conflicts() != null) {
                 throw new LandConflictException(result.conflicts());
             }
             unconfirmed.clear();
-            head = result.landed();   // landed, even if refreshing the working copy below fails
-            headRoot = null;
-            return checkout(result.landed(), mode, sparseDirectories).thenApply(ignored -> result.landed());
+            return result.landed();
         });
     }
 

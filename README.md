@@ -33,19 +33,47 @@ scn ──► scion-daemon ──► scion-cache ──► scion-server ──�
 | scion-daemon | `daemon.ScionDaemon` | One per node (called a workstation here; the post describes daemons "In the fleet"). It stores objects for the node in a bounded (LRU) cache of immutable replies, and talks only to its region's cache. The post gives the bounded cache to the client **[Lite assumption]**. |
 | scion-cache | `cache.ScionCache` | One per region. It caches immutable replies in memory, and on a miss it asks a server. |
 | scion-server | `server.ScionServer` | Authoritative. It reads Spanner and cloud storage, computes derived data and creates changesets. Like every tier, it keeps no long-lived state. |
-| Spanner | `spanner.Spanner` | **One node** standing in for Spanner. It holds tables (`refs`, `changesets`, `root_tree`) with read, insert, write, compare-and-swap and scan. |
+| Spanner | `spanner.Spanner` | **One node** standing in for Spanner. It answers Google Cloud Spanner's `CreateSession`, `Read`, `BeginTransaction`, `Commit` and `Rollback`, over three tables: `refs`, `changesets` and `root_tree`. |
 | Cloud storage | `storage.CloudStorage` | One node. It holds immutable, compressed objects keyed by id. |
 
 As in the post, the daemon, cache and server **answer identical RPCs** (`api.ScionApi`), so the client never needs
 to know the topology. The tiers are strict: a daemon talks only to its cache, a cache only to servers, and only
 servers talk to Spanner and cloud storage.
 
-### Spanner is one node
+### Spanner is one node with Spanner's API
 
-The post doesn't mention Raft, Paxos or consensus, and Scion Lite has none of its own. Scion Lite's `Spanner` is a single node that offers the same kind of API Spanner offers:
-- Every reply waits until what it reports is durable in a journal on that node's simulated disk.
-- Google's Spanner paper (not the post) describes replicating each range of rows with Paxos across zones. Swapping in a replicated implementation would
-  not change any caller.
+The post doesn't mention Raft, Paxos or consensus, and Scion Lite has none of its own. Scion Lite's `Spanner` is a
+single node:
+- Every reply waits until what it reports is durable in a journal on that node's simulated disk. A commit is one
+  journal record, so a crash keeps all of its mutations or none.
+- Google's Spanner paper (not the post) describes replicating each range of rows with Paxos across zones. Swapping in
+  a replicated implementation would not change any caller.
+
+Its calls follow Google's RPC reference for the `google.spanner.v1.Spanner` service
+(https://cloud.google.com/spanner/docs/reference/rpc/google.spanner.v1). Message and field names are the
+reference's, in camel case (`keySet`, `transactionId`, `insertOrUpdate`):
+
+| Call | What Scion Lite supports |
+|---|---|
+| `CreateSession` | Every other call names a session. "Sessions can only execute one transaction at a time", so each server keeps a pool and takes a session for each call or transaction. Sessions live in memory, so a Spanner restart deletes them, and "If a session is deleted, requests to it return NOT_FOUND"; the server then creates a new session and tries once more. |
+| `Read` | A table, columns and a `KeySet` of keys, `KeyRange`s or `all`. With no transaction it is a strong single-use read. A `TransactionSelector` can `begin` a read-write transaction or use one by `id`. Returns a `ResultSet` with `metadata.rowType`. |
+| `BeginTransaction` | Read-write transactions with the `OPTIMISTIC` read lock mode only. |
+| `Commit` | `Mutation`s `insert`, `update`, `insertOrUpdate`, `replace` and `delete`, applied atomically. Either a started transaction's id or a `singleUseTransaction`. Returns a `commitTimestamp`. |
+| `Rollback` | As in the reference, it "returns OK if it successfully aborts the transaction, the transaction was already aborted, or the transaction isn't found". |
+
+Errors carry the reference's codes: `ALREADY_EXISTS` for an insert of an existing row, `NOT_FOUND` for an update of a
+missing one, and `ABORTED` when a row a transaction read has changed since. Values travel as in the reference's JSON
+encoding: `STRING` as a string, `BYTES` as base64.
+
+Spanner has no compare-and-swap call. A scion-server moves a ref with a read-write transaction: `Read` the ref's
+row (beginning the transaction), compare it with the expected value, then `Commit` the new value or `Rollback`. On
+`ABORTED` it retries the transaction from the beginning, as the reference says to. The Rollback is best effort: the
+answer is already known, and Spanner drops an unfinished transaction when its session starts another or it sits
+idle.
+
+Not modelled: `DeleteSession`, other session calls and idle session deletion, `ExecuteSql` and DML, `StreamingRead`,
+partitioned reads and queries, read-only transactions with stale reads, the `PESSIMISTIC` lock mode, indexes,
+multi-column keys, `BatchWrite` and commit stats. Commit timestamps increase but are not TrueTime.
 
 Cloud storage is a single node for the same reason.
 
@@ -73,8 +101,8 @@ Cloud storage is a single node for the same reason.
 
 ## How the operations work
 
-- **Commit.** `scn.commit` sends the tracked edits to a server, which creates the changeset there. "Every commit,
-  rebase, or merge happens on the server, so there's nothing to push." The server writes in a fixed order:
+- **Commit.** `scn.commit` sends the tracked edits to a server, which creates the changeset there. As the post
+  says, "every commit, rebase, or merge happens on the server, so there's nothing to push". The server writes in a fixed order:
   1. Blobs and trees, durably, in cloud storage.
   2. The changeset row in Spanner.
   3. The `root_tree` row.
@@ -98,6 +126,9 @@ Cloud storage is a single node for the same reason.
   3. If someone else moved the branch first, retry.
   4. On a conflict, stop.
 
+  `scn.landChangeset(branch, id)` does the same for a changeset made with `createChangeset`, with no working copy:
+  "many write workloads can also skip the checkout and function entirely via API".
+
   There is no global lock. The post mentions an Antique merge queue but doesn't describe how landing works, so this
   loop stands in for it **[Lite assumption]**.
   - A compare-and-swap whose reply is lost may still have happened, so scn remembers unconfirmed targets. A later
@@ -120,17 +151,21 @@ Cloud storage is a single node for the same reason.
 
 ## Tests
 
-Every test except the unit tests builds the full set of tiers with `sim.ScionSimulation`.
+Every test except the unit tests builds the full set of tiers with `sim.ScionSimulation`. Each of those tests
+begins with a comment describing its scenario step by step.
 
 | Test | What it shows |
 |---|---|
 | `tiers.TierChainTest` | One call travels through every tier to Spanner and back. |
+| `showcase.AgentScaleScenarioTest` | **The realistic scenario.** Agents and jobs, as in the post: a sparse checkout, a virtual checkout served by the regional cache, a bot that writes and lands with no checkout, two jobs on one node sharing its daemon, three concurrent landings merged on the server, a conflict fixed and landed, and a post-merge CI job that asks the server for the merge base and diff and reads only the changed files. |
+| `showcase.ShowcaseTest` | **Start here.** One story through the whole system: seed and land main, a checkout served by the regional cache, a virtual checkout, commits created on the server, two concurrent landings merged on the server, and a third workstation reading the result. |
+| `spanner.SpannerTest` | Spanner's API on its own: strong reads by key, range and `all`; one transaction per session, and a restart deletes sessions; `ALREADY_EXISTS` and `NOT_FOUND` fail a whole commit; a transaction whose read row changed is `ABORTED`, then retried; committing again returns the same outcome; rollback and idle expiry; a crash keeps all of a commit or none; commit timestamps increase across a restart. |
 | `server.ChangesetTest` | A commit is created on the server and records only the files that changed. |
-| `server.ServerOperationsTest` | Unchanged files are dropped; root trees are derived on demand and written back, including over a 150-changeset history; log, diff, merge base, merge and rebase; ref compare-and-swap. |
+| `server.ServerOperationsTest` | Unchanged files are dropped; root trees are derived on demand and written back, including over a 150-changeset history; log, diff, merge base, merge and rebase; ref compare-and-swap, including two servers' overlapping transactions on one ref. |
 | `tiers.TiersTest` | A second workstation is served entirely from the regional cache; the daemon answers repeats; the daemon's cache is bounded; the cache and server answer the same calls as the daemon. |
 | `scn.CheckoutTest` | The objects fetched by full, sparse and virtual checkouts; commit; nothing to push. |
 | `scn.LandingTest` | First landing; three concurrent landings all land; edits to different lines merge; conflicts stop a landing. |
-| `failures.FailureTest` | Spanner and cloud storage crash and restart; a server crash (another serves, and a restarted server starts empty); a partition between cache and servers; write order (a changeset is recorded only after its content is durable). |
+| `failures.FailureTest` | Spanner and cloud storage crash and restart; a server crash (another serves, and a restarted server starts empty); a partition between cache and servers; write order (a changeset is recorded only after its content is durable); a server replacing its Spanner sessions after Spanner restarts. |
 | `randomized.RandomizedLandingTest` | Four workstations in two regions land concurrently with 5% packet loss on every link, over 10 seeds. Every landing reported as successful is in main. |
 | unit tests | Changeset encoding and ids, compression, incremental tree edit, object codec, diff, merge, journal. |
 
@@ -151,5 +186,12 @@ Every test except the unit tests builds the full set of tiers with `sim.ScionSim
 
 As the post says, "Scion is by no means a suitable replacement for git for general use"; neither is Scion Lite.
 TODO.md lists every difference from the post in one place.
+
+## Names
+
+The post names no RPCs or messages. Every Scion call and message name (`createChangeset`, `RebaseRequest`,
+`MoveRefReply`, ...) is Scion Lite's own **[Lite assumption]**; the operations behind them come from the post (see
+`mapping.md`). The Spanner calls are the exception: their names come from Google's Spanner reference. The client
+machines in the tests (alice, bob, carol, dave) are made-up names.
 
 The post describes a single monorepo, so Scion Lite has one repository and no call that creates one.

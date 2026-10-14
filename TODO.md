@@ -26,7 +26,11 @@ Scion Lite models only what the post describes. Where the post is silent, the ch
 - [x] `ScionApi`: the RPCs that daemon, cache and server all answer
 
 ## 4. Spanner (one node; real Spanner runs Paxos per split; same API)
-- [x] Tables of rows: read, insert-if-absent, write, compare-and-swap, scan by prefix
+- [x] Google Cloud Spanner's `CreateSession`, `Read`, `BeginTransaction`, `Commit` and `Rollback` (`google.spanner.v1`),
+      with sessions, mutations, key sets, `OPTIMISTIC` read-write transactions and the reference's error codes
+- [x] Servers keep a session pool and replace sessions that a Spanner restart deleted
+- [x] A ref's compare-and-swap is a read-write transaction in the server, retried on `ABORTED`
+- [x] A commit is one journal record: all of it survives a crash, or none
 - [x] Durable on the simulated disk (Journal); reply only once durable
 - [x] Tables used: `refs`, `changesets` (the changeset write-ahead log **[Lite assumption: kept in Spanner]**),
       `root_tree` (derived data)
@@ -60,7 +64,10 @@ Scion Lite models only what the post describes. Where the post is silent, the ch
 
 ## 9. Tests (simulated network and simulated disks)
 - [x] Unit: changeset encoding, incremental tree edit, compression
-- [x] Spanner: compare-and-swap rules, durability across a crash
+- [x] Spanner: reads, mutation errors, ABORTED transactions, repeated commits, rollback, expiry, sessions, atomic
+      commits across a crash, increasing commit timestamps (`SpannerTest`)
+- [x] Overlapping ref moves on two servers: one wins, the other's Commit is ABORTED and its retry reports the winner
+- [x] A server replaces its sessions after Spanner restarts
 - [x] Cloud storage: durability across a crash
 - [x] Server: create changeset, root tree derived on demand and written back, log, diff, merge base, merge, rebase
 - [x] Tiers: a second workstation in the same region is served from the cache; the daemon's cache is bounded;
@@ -77,7 +84,7 @@ Scion Lite models only what the post describes. Where the post is silent, the ch
 
 
 ## Status
-All items done; `./gradlew test` runs 71 tests.
+All items done; `./gradlew test` runs 82 tests.
 
 ## Differences from the post
 Checked against the post's text twice. Quoted phrases in the code and docs are verbatim from the post.
@@ -102,6 +109,14 @@ Checked against the post's text twice. Quoted phrases in the code and docs are v
   Scion Lite has no load shedding or protection of that kind.
 
 ### [Lite assumptions] (the post is silent)
+- Every Scion RPC and message name. The post names none.
+- Spanner's API is Google's `google.spanner.v1` (from Google's reference, not the post), reduced: no `DeleteSession`
+  or idle session deletion, `ExecuteSql`, DML, streaming or partitioned reads, stale reads, `PESSIMISTIC` locking,
+  indexes or multi-column keys. Sessions live in memory, so a Spanner restart deletes them. Starting a transaction in
+  a session drops the one already open there.
+  Read-write transactions use the `OPTIMISTIC` read lock mode; a transaction idle for 1000 ticks is dropped
+  (Spanner's own idle limit is not modelled). Commit timestamps increase but are not TrueTime.
+- The server retries an aborted ref transaction at most 10 times.
 - Changesets are kept in the Spanner `changesets` table (the post: "an entry in a write-ahead log").
 - Changeset ids are the SHA-256 of an encoding of our own (the post: "All source control data is content-addressed").
   The fields besides parents and changes (author, time, message) are ours too.

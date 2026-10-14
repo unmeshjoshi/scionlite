@@ -8,6 +8,7 @@ import com.tickloom.network.MessageCodec;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.SortedMap;
 import java.util.TreeMap;
@@ -18,12 +19,18 @@ import java.util.TreeMap;
  *
  * <ul>
  *   <li>A change is applied in memory at once, so later operations see it, and is journalled.</li>
+ *   <li>{@link #putAll} journals several changes as one record, so after a crash either all of them are there
+ *       or none is.</li>
  *   <li>{@link #afterDurable} runs an action once every change made so far is durable. Both nodes answer every
  *       request that way, so no caller ever sees a value that a crash could take back.</li>
  * </ul>
  */
 public class DurableTables {
     public record Mutation(String table, String key, byte[] value) {
+    }
+
+    /** One journal record. */
+    private record Batch(List<Mutation> mutations) {
     }
 
     private final Journal journal;
@@ -42,7 +49,7 @@ public class DurableTables {
 
     public TickCompletableFuture<Void> open() {
         return journal.open().thenApply(records -> {
-            records.forEach(bytes -> apply(codec.decode(bytes, Mutation.class)));
+            records.forEach(bytes -> codec.decode(bytes, Batch.class).mutations().forEach(this::apply));
             return null;
         });
     }
@@ -63,10 +70,14 @@ public class DurableTables {
 
     /** A null value deletes the row. */
     public void put(String table, String key, byte[] value) {
-        Mutation mutation = new Mutation(table, key, value);
-        apply(mutation);
+        putAll(List.of(new Mutation(table, key, value)));
+    }
+
+    /** Applies the changes together and journals them as one record. */
+    public void putAll(List<Mutation> mutations) {
+        mutations.forEach(this::apply);
         long sequence = ++appended;
-        journal.append(codec.encode(mutation)).whenComplete((ignored, error) -> {
+        journal.append(codec.encode(new Batch(List.copyOf(mutations)))).whenComplete((ignored, error) -> {
             if (error == null) {
                 durable = Math.max(durable, sequence);
                 runDurableWaiters();

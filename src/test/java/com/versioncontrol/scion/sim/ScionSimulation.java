@@ -105,6 +105,19 @@ public class ScionSimulation implements AutoCloseable {
         return scn;
     }
 
+    /**
+     * Another scn client on the same workstation, for a second job there. It talks to the same daemon, so the post's
+     * "jobs on the same node reuse most of the same objects".
+     */
+    public Scn job(String workstation, String job) throws IOException {
+        ProcessId daemon = Topology.daemon(workstation);
+        if (!topology.regionByDaemon().containsKey(daemon)) {
+            throw new IllegalArgumentException("no workstation " + workstation);
+        }
+        return cluster.newClientConnectedTo(ProcessId.of(Topology.scn(workstation).name() + "-" + job), daemon,
+                Scn::new);
+    }
+
     public Spanner spanner() {
         return cluster.getNode(topology.spanner());
     }
