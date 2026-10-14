@@ -37,6 +37,7 @@ import java.util.Collection;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -292,12 +293,15 @@ public class ScionServer extends RpcNode {
      * so it is a read-write transaction: Read the ref's row (beginning the transaction), compare it with
      * {@code expected} here, then Commit the new value, or Roll back if it differs. Commit returns ABORTED if
      * another transaction changed the row in between; then the whole transaction is retried, as the reference says
-     * to. The target must be a changeset that exists.
+     * to. The target must be a changeset that exists, and descend from {@code expected}: refs only move forward
+     * [Lite assumption: the post doesn't say; real servers enforce this, or permissions, so that no caller can rewind
+     * main]. Moving a ref to the changeset it points at is allowed. The check runs before the transaction, against
+     * {@code expected}; if the ref holds something else, the compare fails anyway.
      */
     private TickCompletableFuture<MoveRefReply> moveRef(MoveRefRequest request) {
         record Attempt(int number, MoveRefReply reply) {
         }
-        return changeset(request.target()).thenCompose(target -> Futures.loop(new Attempt(0, null),
+        return changeset(request.target()).thenCompose(target -> requireFastForward(request)).thenCompose(ok -> Futures.loop(new Attempt(0, null),
                 attempt -> attempt.reply() != null, attempt -> {
                     if (attempt.number() == MAX_TRANSACTION_ATTEMPTS) {
                         throw new RpcException("moveRef " + request.name() + ": aborted "
@@ -316,6 +320,19 @@ public class ScionServer extends RpcNode {
                     });
                     return next;
                 }).thenApply(Attempt::reply));
+    }
+
+    private TickCompletableFuture<Void> requireFastForward(MoveRefRequest request) {
+        if (request.expected() == null) {
+            return TickCompletableFuture.completed(null);
+        }
+        return isAncestor(request.expected(), request.target()).thenApply(descends -> {
+            if (!descends) {
+                throw new RpcException("moveRef " + request.name() + ": " + request.target()
+                        + " does not descend from " + request.expected() + "; refs only move forward");
+            }
+            return null;
+        });
     }
 
     /**
@@ -373,44 +390,73 @@ public class ScionServer extends RpcNode {
 
     /** Every ancestor of {@code from}, including itself. */
     private TickCompletableFuture<Set<String>> ancestors(String from) {
-        record Walk(Deque<String> queue, Set<String> seen) {
-        }
-        return Futures.loop(new Walk(new ArrayDeque<>(List.of(from)), new HashSet<>(List.of(from))),
-                w -> w.queue().isEmpty(),
-                w -> changeset(w.queue().removeFirst()).thenApply(changeset -> {
-                    changeset.parents().forEach(p -> {
-                        if (w.seen().add(p)) {
-                            w.queue().addLast(p);
-                        }
-                    });
-                    return w;
-                }))
-                .thenApply(Walk::seen);
+        return ancestry(from).thenApply(Map::keySet);
     }
 
-    /** The common ancestor nearest to {@code second}, searching breadth first; null if there is none. */
-    private TickCompletableFuture<String> mergeBase(String first, String second) {
-        return ancestors(first).thenCompose(ofFirst -> {
-            record Walk(Deque<String> queue, Set<String> seen, String found) {
-            }
-            return Futures.loop(new Walk(new ArrayDeque<>(List.of(second)), new HashSet<>(List.of(second)), null),
-                    w -> w.found() != null || w.queue().isEmpty(),
-                    w -> {
-                        String id = w.queue().removeFirst();
-                        if (ofFirst.contains(id)) {
-                            return TickCompletableFuture.completed(new Walk(w.queue(), w.seen(), id));
-                        }
-                        return changeset(id).thenApply(changeset -> {
-                            changeset.parents().forEach(p -> {
-                                if (w.seen().add(p)) {
-                                    w.queue().addLast(p);
-                                }
-                            });
-                            return w;
+    /** Every ancestor of {@code from}, including itself, with its parents, in breadth-first order. */
+    private TickCompletableFuture<Map<String, List<String>>> ancestry(String from) {
+        record Walk(Deque<String> queue, Set<String> seen, Map<String, List<String>> parents) {
+        }
+        return Futures.loop(new Walk(new ArrayDeque<>(List.of(from)), new HashSet<>(List.of(from)), new LinkedHashMap<>()),
+                w -> w.queue().isEmpty(),
+                w -> {
+                    String id = w.queue().removeFirst();
+                    return changeset(id).thenApply(changeset -> {
+                        w.parents().put(id, changeset.parents());
+                        changeset.parents().forEach(p -> {
+                            if (w.seen().add(p)) {
+                                w.queue().addLast(p);
+                            }
                         });
-                    })
-                    .thenApply(Walk::found);
-        });
+                        return w;
+                    });
+                })
+                .thenApply(Walk::parents);
+    }
+
+    /** Whether {@code ancestor} is {@code from} or one of its ancestors. The walk stops when it finds it. */
+    private TickCompletableFuture<Boolean> isAncestor(String ancestor, String from) {
+        record Walk(Deque<String> queue, Set<String> seen, boolean found) {
+        }
+        return Futures.loop(new Walk(new ArrayDeque<>(List.of(from)), new HashSet<>(List.of(from)), false),
+                w -> w.found() || w.queue().isEmpty(),
+                w -> {
+                    String id = w.queue().removeFirst();
+                    if (id.equals(ancestor)) {
+                        return TickCompletableFuture.completed(new Walk(w.queue(), w.seen(), true));
+                    }
+                    return changeset(id).thenApply(changeset -> {
+                        changeset.parents().forEach(p -> {
+                            if (w.seen().add(p)) {
+                                w.queue().addLast(p);
+                            }
+                        });
+                        return w;
+                    });
+                })
+                .thenApply(Walk::found);
+    }
+
+    /**
+     * A best common ancestor, as git's merge-base finds: a common ancestor that no other common ancestor descends
+     * from. The first common ancestor a walk meets is not always one: after a merge it can be an older changeset, and
+     * merging from it would undo changes made since. Every ancestor of a common ancestor is common too, so the best
+     * ones are the common ancestors that are not a parent of a common ancestor. After a criss-cross merge there can be
+     * several; this returns the one nearest to {@code second}, breadth first [Lite assumption: git's recursive
+     * strategy merges them into one]. Null if there is no common ancestor.
+     */
+    private TickCompletableFuture<String> mergeBase(String first, String second) {
+        return ancestors(first).thenCompose(ofFirst -> ancestry(second).thenApply(ofSecond -> {
+            Set<String> older = new HashSet<>();
+            ofSecond.forEach((id, parents) -> {
+                if (ofFirst.contains(id)) {
+                    older.addAll(parents);
+                }
+            });
+            return ofSecond.keySet().stream()
+                    .filter(id -> ofFirst.contains(id) && !older.contains(id))
+                    .findFirst().orElse(null);
+        }));
     }
 
     private TickCompletableFuture<DiffReply> diff(DiffRequest request) {

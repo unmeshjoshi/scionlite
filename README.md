@@ -98,6 +98,7 @@ Cloud storage is a single node for the same reason.
 - **Refs**:
   - A row in the Spanner `refs` table.
   - Moving a ref is a compare-and-swap on that one row, and it is a separate step from creating changesets.
+  - A ref only moves forward: the new target must descend from the changeset it points at **[Lite assumption]**.
 
 ## How the operations work
 
@@ -118,6 +119,10 @@ Cloud storage is a single node for the same reason.
   - Virtual: nothing is fetched up front, and each file is fetched when it is first read.
 - **Server operations.** `getObject`, `getChangeset`, `getRootTree`, `log`, `diff` (which skips subtrees whose
   ids are equal), `mergeBase`, `rebase` and `merge`.
+  - `mergeBase` returns a best common ancestor, as git's merge-base does: a common ancestor that no other common
+    ancestor descends from. The first common ancestor a walk meets is not always one, and merging from an older
+    one would undo changes made since. After a criss-cross merge there can be several; Scion Lite picks one, where
+    git's recursive strategy merges them **[Lite assumption]**.
   - Rebase replays only the paths each changeset recorded. Files that both sides changed are merged line by line,
     and real conflicts are reported.
 - **Land.** `scn.land(branch)`:
@@ -161,7 +166,7 @@ begins with a comment describing its scenario step by step.
 | `showcase.ShowcaseTest` | **Start here.** One story through the whole system: seed and land main, a checkout served by the regional cache, a virtual checkout, commits created on the server, two concurrent landings merged on the server, and a third workstation reading the result. |
 | `spanner.SpannerTest` | Spanner's API on its own: strong reads by key, range and `all`; one transaction per session, and a restart deletes sessions; `ALREADY_EXISTS` and `NOT_FOUND` fail a whole commit; a transaction whose read row changed is `ABORTED`, then retried; committing again returns the same outcome; rollback and idle expiry; a crash keeps all of a commit or none; commit timestamps increase across a restart. |
 | `server.ChangesetTest` | A commit is created on the server and records only the files that changed. |
-| `server.ServerOperationsTest` | Unchanged files are dropped; root trees are derived on demand and written back, including over a 150-changeset history; log, diff, merge base, merge and rebase; ref compare-and-swap, including two servers' overlapping transactions on one ref. |
+| `server.ServerOperationsTest` | Unchanged files are dropped; root trees are derived on demand and written back, including over a 150-changeset history; log, diff, merge base (the best common ancestor, not the nearest), merge and rebase; ref compare-and-swap, including two servers' overlapping transactions on one ref; refs only move forward. |
 | `tiers.TiersTest` | A second workstation is served entirely from the regional cache; the daemon answers repeats; the daemon's cache is bounded; the cache and server answer the same calls as the daemon. |
 | `scn.CheckoutTest` | The objects fetched by full, sparse and virtual checkouts; commit; nothing to push. |
 | `scn.LandingTest` | First landing; three concurrent landings all land; edits to different lines merge; conflicts stop a landing. |

@@ -119,6 +119,65 @@ class ServerOperationsTest {
     }
 
     /**
+     * Scenario: the first common ancestor a walk meets is not the merge base.
+     * 1. root holds f. x, on top of root, adds g. y, on top of x, edits line 2 of f.
+     * 2. On main, q and then q2 follow y. On a side branch, w adds k on top of x. m merges w into q2.
+     * 3. revert, on top of y, puts f back as it was.
+     * The common ancestors of revert and m are y, x and root. Walking back from m reaches x (through w) before y
+     * (through q2 and q), but y descends from x, so y is the merge base.
+     * Then the merge base is y from either side, and merging m into revert keeps the revert. Merging from x would
+     * bring y's edit back.
+     */
+    @Test
+    void theMergeBaseIsTheBestCommonAncestorNotTheNearest() throws Exception {
+        try (ScionSimulation sim = ScionSimulation.builder().region("west", "alice").build(1)) {
+            Scn alice = sim.scn("alice");
+            String original = "1\n2\n3\n";
+            String root = sim.await(alice.createChangeset(List.of(), Map.of("f", original), "root"));
+            String x = sim.await(alice.createChangeset(List.of(root), Map.of("g", "x"), "x"));
+            String y = sim.await(alice.createChangeset(List.of(x), Map.of("f", "1\nY\n3\n"), "y"));
+            String q = sim.await(alice.createChangeset(List.of(y), Map.of("h", "q"), "q"));
+            String q2 = sim.await(alice.createChangeset(List.of(q), Map.of("h", "q2"), "q2"));
+            String w = sim.await(alice.createChangeset(List.of(x), Map.of("k", "w"), "w"));
+            MergeReply m = sim.await(alice.merge(q2, w, "m"));
+            assertEquals(List.of(), m.conflicts());
+            assertEquals(List.of(q2, w), sim.await(alice.getChangeset(m.changeset())).parents());
+            String revert = sim.await(alice.createChangeset(List.of(y), Map.of("f", original), "revert"));
+
+            assertEquals(y, sim.await(alice.mergeBase(revert, m.changeset())));
+            assertEquals(y, sim.await(alice.mergeBase(m.changeset(), revert)));
+            MergeReply merged = sim.await(alice.merge(revert, m.changeset(), "merge m into revert"));
+            assertEquals(List.of(), merged.conflicts());
+            assertEquals(original, sim.await(alice.readAllFiles(merged.changeset())).get("f"), "the revert is kept");
+        }
+    }
+
+    /**
+     * Scenario: a ref only moves forward [Lite assumption].
+     * 1. main moves from a to its child b.
+     * 2. Moving main back to a fails, and so does moving it to c, a sibling of b.
+     * 3. Moving main to the changeset it already points at is allowed.
+     * Then main is still b.
+     */
+    @Test
+    void refsOnlyMoveForward() throws Exception {
+        try (ScionSimulation sim = ScionSimulation.builder().region("west", "alice").build(1)) {
+            Scn alice = sim.scn("alice");
+            String a = sim.await(alice.createChangeset(List.of(), Map.of("f", "a"), "a"));
+            String b = sim.await(alice.createChangeset(List.of(a), Map.of("f", "b"), "b"));
+            String c = sim.await(alice.createChangeset(List.of(a), Map.of("f", "c"), "c"));
+            assertTrue(sim.await(alice.moveRef("main", null, a)).swapped());
+            assertTrue(sim.await(alice.moveRef("main", a, b)).swapped());
+
+            assertTrue(sim.awaitFailure(alice.moveRef("main", b, a)).getMessage().contains("refs only move forward"));
+            assertTrue(sim.awaitFailure(alice.moveRef("main", b, c)).getMessage().contains("refs only move forward"));
+            assertTrue(sim.await(alice.moveRef("main", b, b)).swapped());
+
+            assertEquals(b, sim.await(alice.resolveRef("main")));
+        }
+    }
+
+    /**
      * Scenario: ours edits line one of f, theirs edits line five and adds h. The server merges them.
      * Then there are no conflicts, the merge records both parents, and it holds both edits plus h.
      */

@@ -84,7 +84,7 @@ Scion Lite models only what the post describes. Where the post is silent, the ch
 
 
 ## Status
-All items done; `./gradlew test` runs 82 tests.
+All items done; `./gradlew test` runs 84 tests.
 
 ## Differences from the post
 Checked against the post's text twice. Quoted phrases in the code and docs are verbatim from the post.
@@ -117,6 +117,9 @@ Checked against the post's text twice. Quoted phrases in the code and docs are v
   Read-write transactions use the `OPTIMISTIC` read lock mode; a transaction idle for 1000 ticks is dropped
   (Spanner's own idle limit is not modelled). Commit timestamps increase but are not TrueTime.
 - The server retries an aborted ref transaction at most 10 times.
+- A ref only moves forward: `moveRef` fails unless the target descends from `expected`.
+- After a criss-cross merge, `mergeBase` returns one of the best common ancestors (git's recursive strategy merges
+  them).
 - Changesets are kept in the Spanner `changesets` table (the post: "an entry in a write-ahead log").
 - Changeset ids are the SHA-256 of an encoding of our own (the post: "All source control data is content-addressed").
   The fields besides parents and changes (author, time, message) are ours too.

@@ -38,7 +38,7 @@ Source root: `src/main/java/com/versioncontrol/scion/`.
 | Author and time | `CreateChangesetRequest.author`, `.time` | **[Lite assumption]** Supplied by the client, so a retry names the same changeset. |
 | Trees | `objects.Tree`, stored in cloud storage | **[Lite assumption]** The post mentions root trees and recursive tree fetches but not where trees are stored. |
 | Refs are discouraged "except for the main ref or release branches" | Rows of the Spanner `refs` table | |
-| "moving one is a compare-and-swap on a single Spanner row that happens separately from creating changesets" | `ScionServer.moveRef` | Spanner has no compare-and-swap call, so the server runs a read-write transaction on the ref's row: `Read` (beginning the transaction), compare, then `Commit` or `Rollback`, retrying on `ABORTED`. |
+| "moving one is a compare-and-swap on a single Spanner row that happens separately from creating changesets" | `ScionServer.moveRef` | Spanner has no compare-and-swap call, so the server runs a read-write transaction on the ref's row: `Read` (beginning the transaction), compare, then `Commit` or `Rollback`, retrying on `ABORTED`. **[Lite assumption]** A ref only moves forward: the target must descend from `expected`. |
 
 ## Derived data and server-side operations
 
@@ -48,7 +48,7 @@ Source root: `src/main/java/com/versioncontrol/scion/`.
 | "we can choose whether to compute it eagerly or defer the work"; servers "write the results back to Spanner" | `ScionServer.DerivedData` (EAGER, DEFERRED), the `root_tree` table | A missing root tree is computed by walking back to the nearest known one, in a loop rather than recursion. |
 | Changesets are accepted with "no locking or cross-server coordination" | `ScionServer.createChangeset`, `persist` | **[Lite assumption]** Write order: content made durable in cloud storage, then the Spanner row, then the root tree, then the reply. |
 | "every commit, rebase, or merge happens on the server" | `ScionServer.createChangeset`, `rebase`, `merge` | Rebase replays only the recorded paths. Text merge is diff3 (`merge.TextMerge`). |
-| Servers provide APIs "such as getting changesets, computing diffs, finding merge bases, and fetching blobs" | `getChangeset`, `diff`, `mergeBase`, `getObject`, plus `log`, `getRootTree`, `listRefs`, `resolveRef` | `diff` skips subtrees whose ids match. |
+| Servers provide APIs "such as getting changesets, computing diffs, finding merge bases, and fetching blobs" | `getChangeset`, `diff`, `mergeBase`, `getObject`, plus `log`, `getRootTree`, `listRefs`, `resolveRef` | `diff` skips subtrees whose ids match. `mergeBase` returns a best common ancestor (one no other common ancestor descends from), as git's merge-base does. **[Lite assumption]** After a criss-cross merge it picks one of several, nearest to the second argument; git's recursive strategy merges them. |
 | Rebase onto a changed base | `RebaseRequest.since` | **[Lite assumption]** Replays only the changesets after `since`. scn uses this after a landing whose outcome was unknown. |
 
 ## Client
